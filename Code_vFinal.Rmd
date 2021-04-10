@@ -1,0 +1,508 @@
+---
+title: "Social Data Science - Analysis of Swiss Parliament tweet response on Covid measures"
+author: "Maria Guskova, Simon Neff, Cédric Jeannerat"
+output:
+  pdf_document: default
+  html_notebook: default
+editor_options:
+  chunk_output_type: inline
+---
+#Preparation
+```{r}
+library(dplyr)
+library(tidyr)
+library(rtweet)
+library(ggplot2)
+library(textcat)
+Sys.setlocale(category = "LC_TIME", locale = "English") # set time labels to English
+get_token()
+```
+
+##Information:
+Within the script "Fraction" was used to reference the political party of a parliament member. The "Mitte" fraction is a coalition of three parties (Mitte (former CVP), EVP, BDP). The other fractions are almost equal to the party with the same name. Hence, fraction and party can be used synonymous. For clarity reasons we use "party" in plot descriptions and reports.
+
+#Clean list of all parliament users
+```{r}
+load("Twitter_users_parliament.csv")
+
+#remove all lines with NA
+parliament %>%
+  drop_na() -> parliament
+
+table(parliament$Fraction) # share of parliament members with active twitter account by party
+```
+#load all tweets from the parliament and clean them 
+```{r}
+#create userlist  wit twitter User id from parliament list
+userlist <- as.character(parliament$TwitterUserId)
+
+tweets <- get_timelines(userlist, n =500, retrayonlimit = T)
+
+#save it for storage
+save(tweets, file = "tweets.csv")
+load("tweets.csv")
+
+#check users for whom first tweet extracted is after 28.02.2020 (First Corona measure) and load more tweets
+tweets %>%
+  group_by(screen_name) %>%
+  summarise(first = range(created_at)[1]) %>%
+  filter(first > "2020-02-28") -> uncomplete_users
+
+ntweets <- 1000
+
+while (nrow(uncomplete_users) > 0) {
+  print(paste(nrow(uncomplete_users), "remaining"))
+  tweets_add <- get_timelines(uncomplete_users$screen_name, n = ntweets)
+  tweets <- rbind(tweets, tweets_add)
+
+  tweets %>%
+  group_by(screen_name) %>%
+  summarise(first = range(created_at)[1]) %>%
+  filter(first > "2020-02-28") -> uncomplete_users
+
+  if (ntweets == 3600) { # exit loop if max number of tweets are pulled
+    break
+  }
+  ntweets <- 2*ntweets
+  ntweets <- ifelse(ntweets > 3600, 3600, ntweets)
+}
+
+#save to storage
+save(tweets, file = "tweets.csv")
+load("tweets.csv")
+
+#change created at to Swiss time (initially UTC)
+#remove tweets older than 28.02.2020 (First Corona measure) and retweets
+tweets %>%
+  mutate(created_at = as.POSIXct(format(created_at, tz = "CET"))) %>%
+  filter(created_at >= "2020-02-28" & !is_retweet) -> tweets2020
+tweets2020
+  
+#plot frequency of tweets
+ts_plot(tweets2020, "1 day") +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(plot.title = ggplot2::element_text(face = "bold")) +
+  ggplot2::labs(
+    x = NULL, y = NULL,
+    title = "Frequency of #rstats Twitter statuses from 28.02.2020 posted from parliament members",
+    subtitle = "Twitter status (tweet) counts aggregated using 1 day intervals",
+    caption = "\nSource: Data collected from Twitter's REST API via rtweet"
+  )
+```
+
+#Extract tweets which are at the day +2 of the announcements
+```{r}
+#dates for the days when announcements were made
+corona_updates <- read.csv2("Corona_measures_and_loosening.csv", stringsAsFactors = FALSE) %>%
+  mutate(Date = as.Date(Date),
+         DateTime_start = as.POSIXct(paste(Date, Time), tz = "CET"),
+         DateTime_end = DateTime_start + 172800) # +2 days
+
+event_tweets <- data.frame()
+
+# iterate through announcements (press conferences):
+# - keep only tweets that are within 48 hours from the time of the press release
+# - add announcement information (isLoosening)
+for (i in 1:nrow(corona_updates)){
+  tweets2020 %>%
+  filter(created_at >= corona_updates$DateTime_start[i] & created_at <= corona_updates$DateTime_end[i]) %>%
+  mutate(isLoosening = corona_updates$isLoosening[i],
+         eventID = i,
+         DateTime_PressConf = corona_updates$DateTime_start[i]) -> temp
+
+  event_tweets <- rbind(event_tweets,temp)
+}
+print(event_tweets)
+# event_tweets now includes all tweets that are within 48 hours from the time of a press release
+
+ts_plot(event_tweets, "1 day") +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(plot.title = ggplot2::element_text(face = "bold")) +
+  ggplot2::labs(
+    x = NULL, y = NULL,
+    title = "Frequency of #rstats Twitter statuses from past XXX days",
+    subtitle = "Twitter status (tweet) counts aggregated using XXX intervals",
+    caption = "\nSource: Data collected from Twitter's REST API via rtweet"
+  )
+```
+
+#Create final dataset where user information and tweets are mapped
+```{r}
+# merge tweets with name and party information
+twitterdf <- merge(event_tweets, parliament, by.x = "user_id",  by.y = "TwitterUserId" )
+twitterdf <- twitterdf %>%
+  select(created_at, DateTime_PressConf, eventID, isLoosening, Surname, FirstName, Fraction, Council, text)
+twitterdf <- twitterdf[!duplicated(twitterdf),]
+
+# save to storage
+save(twitterdf, file = "twittereventdata.csv")
+load("twittereventdata.csv")
+```
+
+#Filter data for Top hashtags
+```{r}
+library(tidytext)
+library(stringr)
+
+# filter top used hastags to get ideas of what keywords to filter for covid-related tweets
+twitterdf %>% 
+  unnest_tokens(hashtag, text, "tweets", to_lower = FALSE) %>%
+  filter(str_detect(hashtag, "^#")) %>%
+  count(hashtag, sort = TRUE) %>%
+  top_n(20)->top_hashtags
+
+top_hashtags$hashtag
+
+```
+
+#Keywords when we translate to english
+```{r}
+library(stopwords)
+# filter most used words excluding stop words to get ideas of what keywords to filter for covid-related tweets
+
+stop_german <- data.frame(word = stopwords::stopwords("de"), stringsAsFactors = FALSE)
+stop_french<- data.frame(word = stopwords::stopwords("fr"), stringsAsFactors = FALSE)
+stop_italian <- data.frame(word = stopwords::stopwords("it"), stringsAsFactors = FALSE)
+
+words <- twitterdf %>%
+  mutate(text = str_remove_all(text, "&amp;|&lt;|&gt;"),
+         text = str_remove_all(text, "\\s?(f|ht)(tp)(s?)(://)([^\\.]*)[\\.|/](\\S*)"),
+         text = str_remove_all(text, "[^\x01-\x7F]")) %>% 
+  unnest_tokens(word, text, token = "tweets") %>%
+  filter(!word %in% stop_words$word,
+         !word %in% stop_german$word,
+         !word %in% stop_french$word,
+         !word %in% stop_italian$word,
+         !word %in% str_remove_all(stop_words$word, "'"),
+         !word %in% str_remove_all(stop_german$word, "'"),
+         !word %in% str_remove_all(stop_french$word, "'"),
+         !word %in% str_remove_all(stop_italian$word, "'"),
+         str_detect(word, "[a-z]"),
+         !str_detect(word, "^#"),         
+         !str_detect(word, "@\\S+")) %>%
+  count(word, sort = TRUE)
+words
+
+
+
+```
+
+#Translation
+```{r}
+library(googleLanguageR)
+# Translate the tweets using the Google Translate API and own Google Cloud Project
+# For security reasons, the json key-file cannot be shared. For reproduction create own Google Cloud Project, activate Translation API and create service account key.
+# Translation is free of charge for a certain number of characters (enough for this project).
+
+gl_auth("GCP_service_accout_key.json") # add your own key-file location here
+
+twitterdf$text <- gsub("\\n","",twitterdf$text) # remove line breaks from tweets
+
+translated <- gl_translate(t_string = twitterdf$text, target = "en", format = "text") # translate tweets to english using auto language detection
+
+# merge translated text and detected language information
+twitterdf <- twitterdf %>%
+  mutate(text_en = translated$translatedText,
+         language = translated$detectedSourceLanguage)
+
+save(twitterdf, file = "twitterTranslated.csv")
+load("twitterTranslated.csv")
+```
+
+#Filter covid-related tweets
+```{r}
+# vector of keywords to filter for covid-related tweets 
+words <- c("covid","covid19","covid-19","corona","sarscov","sars-cov","sarscov2","sars-cov2","sarscov-2","sars-cov-2","lockdown","shutdown","loosening","lockerung","pandemie",
+           
+           # from hashtags results
+           "coronavirus","coronakrise","parlCH","covid2019","Bundesrat",
+           
+           #from the word count analysis
+           "massnahmen","virus","krise","gesundheit","bund","entscheiden","nationalrat","gesetz","empfehlungen","parlement","fallzahlen","gesundheitswesen"
+      
+           
+           ) # check for this words
+pattern <- paste(words, collapse = "|") # in readable format
+
+twitterdf <- twitterdf %>%
+  mutate(index_in = str_detect(string = text, pattern = regex(pattern = pattern, ignore_case = TRUE)), # search for keywords in initial language 
+         index_en = str_detect(string = text_en, pattern = regex(pattern = pattern, ignore_case = TRUE)), # search for keywords in English
+         index = ifelse(index_in | index_en, TRUE, FALSE)) # include tweet if at least one keyword was in at least one of the languages
+
+# Check number of included tweets
+table(twitterdf$index_in)
+table(twitterdf$index_en)
+table(twitterdf$index)
+
+# Filter tweets that match keyword inclusion, each tweet gets an ID (tweetID)
+twitter_covid <- twitterdf %>%
+  filter(index) %>%
+  arrange(created_at) %>%
+  mutate(Date = as.Date(created_at),
+         tweetID = row_number(),
+         Fraction = factor(Fraction, levels = c("SP", "Grüne", "GLP", "Mitte", "FDP", "SVP")))
+
+# COVID-19 data from Federal Office of Public Health FOPH (https://www.covid19.admin.ch/en/overview)
+load("COVID19Cases_geoRegion.csv")
+cov_ch <- cov_ch %>%
+  filter(geoRegion == "CHFL" & datum %in% paste(corona_updates$Date)) %>% # include only cases for Switzerland and Liechtenstein (exclude canton data) and filter press conference dates
+  mutate(eventID = row_number()) %>%
+  select(eventID, cases = entries, mean7d)
+
+# merge COVID-19 data to tweets
+twitter_covid <- twitter_covid %>%
+  inner_join(cov_ch, by = c("eventID"))
+
+# remove tweets detected to be unrelated; during the analysis some tweets were detected to be not related to corona measures updates and are manually excluded here
+twitter_covid <- twitter_covid %>%
+  filter(!tweetID %in% c(506, 780, 783, 883, 886))
+```
+
+#Sentiment Analysis
+```{r}
+library(vader)
+# Sentiment analysis of the translated tweets using the vader package
+
+sent <- vader_df(twitter_covid$text_en)
+twitter_covid <- twitter_covid %>%
+  inner_join(sent, by = c("text_en" = "text"))
+
+save(twitter_covid, file = "twitterCovid.csv")
+load("twitterCovid.csv")
+```
+
+#Frequencies
+```{r}
+# vectors and data frames to use in plots
+colors_fractions <- c("SP" = "red", "Grüne" = "green", "GLP" = "#999C3D", "Mitte" = "#BF8302", "FDP" = "#0373FC", "SVP" = "#0D6305") # colors of parties
+colors_events <- c("0" = "red", "1" = "green")
+# red and green background segments to visualize times of new measures and loosening
+event_segments <- data.frame(start = c(1, 4.5, 9.5, 16.5),
+                             start.date = as.Date(c("2020-02-28", "2020-04-16", "2020-07-01", "2021-02-17")),
+                             end = c(4.5, 9.5, 16.5, 18),
+                             end.date = as.Date(c("2020-03-23", "2020-06-22", "2021-01-15", "2021-02-27")),
+                             fill = rep(c("New measures", "Loosening"), 2))
+# labels to relate press conference ID (eventID) to time
+event_labels <- data.frame(x = c(3,7,12,17),
+                           lbls = c("March 2020","May 2020","October 2020","February 2021"))
+
+# Plot tweet frequency by day
+tweetByDay <- data.frame(Date = seq.Date(min(twitter_covid$Date), max(twitter_covid$Date), by = "day")) %>%
+  left_join(
+    twitter_covid %>%
+    group_by(Date) %>%
+    summarise(count = n())
+  ) %>%
+  replace(is.na(.), 0)
+
+p <- ggplot() +
+  geom_line(aes(x = Date, y = count), data = tweetByDay) +
+  labs(
+    x = NULL,
+    y = "Count",
+    title = "Frequency of Tweets after Press Conferences",
+    subtitle = "Twitter status (tweet) counts aggregated using 1 day intervals"
+  ) +
+  geom_rect(aes(xmin = event_segments$start.date, xmax = event_segments$end.date, ymin = -Inf, ymax = Inf, fill = event_segments$fill), alpha = 0.1) +
+  scale_fill_manual(values = c("New measures" = "red", "Loosening" = "green"), limits = c("New measures", "Loosening")) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.position = "bottom",
+        legend.title = element_blank())
+# save plot
+ggsave(filename = "plots/Tweet_freq_by_day.png", plot = p, device = "png", width = 9, height = 5)
+
+# Plot tweet frequency by political fraction
+tweetsFraction <- twitter_covid %>%
+  group_by(Fraction) %>%
+  summarise(count = n()) %>%
+  arrange(desc(Fraction)) %>%
+  mutate(labelpos = (cumsum(count) - count) / 2 + lag(count, default = 0),
+         label = paste(Fraction, "\n", round(count / sum(count) * 100, 1), "%"))
+
+p <- ggplot(tweetsFraction, aes(x = 1, y = count, fill=Fraction)) +
+  geom_bar(stat = "identity", alpha = 0.8, color = "white") +
+  coord_flip() +
+  scale_y_reverse() +
+  geom_text(aes(label = label), size = 4, position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = colors_fractions) +
+  labs(x = NULL,
+       y = NULL,
+       title = "Tweets Frequency by Party",
+       subtitle = "Tweets between February 2020 and February 2021") +
+  theme_void() +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+# save plot
+ggsave(filename = "plots/Tweet_freq_by_party.png", plot = p, device = "png", width = 9, height = 1)
+```
+
+#General Sentiment by Party
+```{r}
+# Plot overall sentiment by party
+p <- ggplot(twitter_covid, aes(x = Fraction, y = compound, fill = Fraction)) +
+  geom_boxplot(width = 0.5, alpha = 0.8) +
+  labs(x = "Party",
+       y = "Sentiment",
+       title = "General Sentiment by Party",
+       subtitle = "Package: Vader") +
+  scale_fill_manual(values = colors_fractions) +
+  scale_y_continuous() +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.position = "none")
+# save plot
+ggsave(filename = "plots/sentiment_by_party.png", plot = p, device = "png", width = 9, height = 5)
+
+# OLS regression of general sentiment by party
+summary(lm(compound ~ Fraction, data = twitter_covid))
+```
+
+#Sentiment over Time
+```{r}
+# Plot sentiment boxplot by event
+p <- ggplot(twitter_covid) +
+  geom_boxplot(aes(x = eventID, y = compound, group = eventID, fill = paste(isLoosening)), alpha = 0.8) +
+  geom_line(aes(x = eventID, y = mean7d/8000, lty = "")) +
+  geom_text(aes(x = x, y = -0.95, label = lbls), size = 3.5, data = event_labels) + # month labels
+  labs(x = "Press conference ID",
+       y = "Sentiment",
+       title = "General Sentiment by Event",
+       subtitle = "Package: Vader") +
+  scale_x_continuous(breaks = sort(unique(twitter_covid$eventID))) +
+  scale_y_continuous(sec.axis = sec_axis(~.*8000, breaks = seq(-8000,8000,4000), labels = c("","","0","4'000","8'000"), name = "COVID cases 7d avg.")) +
+  scale_fill_manual(values = colors_events, labels = c("0" = "New measure", "1" = "Loosening"), name = "") +
+  scale_linetype_manual(values = 2, name = "COVID-19 cases") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.position = "bottom",
+        panel.grid.minor = element_blank())
+# save plot
+ggsave(filename = "plots/sentiment_box_by_eventID.png", plot = p, device = "png", width = 9, height = 5)
+
+# Plot sentiment by fraction and press conference
+fractionByEvent <- twitter_covid %>%
+  group_by(eventID, Fraction) %>%
+  summarise(medianCompound = median(compound))
+
+p <- ggplot() +
+  geom_rect(aes(xmin = event_segments$start, xmax = event_segments$end, ymin = -Inf, ymax = Inf, fill = event_segments$fill), alpha = 0.1) + # red and green background segments to visualize times of new measures and loosening
+  geom_line(aes(x = eventID, y = medianCompound, color = Fraction), size = 0.7, data = fractionByEvent) +
+  geom_text(aes(x = x, y = -0.9, label = lbls), size = 3.5, data = event_labels) + # month labels
+  labs(x = "Press conference ID",
+       y = "Median sentiment",
+       title = "Sentiment by Event and Party",
+       subtitle = "Package: Vader") +
+  scale_x_continuous(breaks = sort(unique(twitter_covid$eventID))) +
+  scale_y_continuous() +
+  scale_color_manual(values = colors_fractions) +
+  scale_fill_manual(values = c("New measures" = "red", "Loosening" = "green"), limits = c("New measures", "Loosening")) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        panel.grid.minor = element_blank())
+# save plot
+ggsave(filename = "plots/sentiment_line_by_party.png", plot = p, device = "png", width = 9, height = 5)
+
+# Plot sentiment variance between fractions
+sentRangeByEvent <- fractionByEvent %>%
+  group_by(eventID) %>%
+  summarise(compoundVar = var(medianCompound))
+
+p <- ggplot() +
+  geom_rect(aes(xmin = event_segments$start + c(-0.5,0,0,0), xmax = event_segments$end + c(0,0,0,0.5), ymin = -Inf, ymax = Inf, fill = event_segments$fill), alpha = 0.1) +
+  geom_bar(aes(x = eventID, y = compoundVar), fill = "#646464", stat = "identity", data = sentRangeByEvent) +
+  geom_text(aes(x = x, y = -0.01, label = lbls), size = 3.5, data = event_labels) + # month labels
+  labs(x = "Press conference ID",
+       y = "Sentiment variance",
+       title = "Variance of Sentiment between Parties",
+       subtitle = "Package: Vader") +
+  scale_x_continuous(breaks = sort(unique(twitter_covid$eventID))) +
+  scale_fill_manual(values = c("New measures" = "red", "Loosening" = "green"), limits = c("New measures", "Loosening")) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        panel.grid.minor = element_blank())
+# save plot
+ggsave(filename = "plots/sentiment_var_by_party.png", plot = p, device = "png", width = 9, height = 5)
+```
+
+#Sentiment by Wave
+```{r}
+# Plot sentiment boxplot by wave and party
+twitter_covid$wave <- factor(case_when(twitter_covid$eventID <= 4 ~ "First wave",
+                                between(twitter_covid$eventID, 5, 9) ~ "First recovery",
+                                between(twitter_covid$eventID, 10, 16) ~ "Second wave",
+                                twitter_covid$eventID >= 17 ~ "Second recovery"),
+                             levels = c("First wave", "First recovery", "Second wave", "Second recovery"))
+
+ggplot(twitter_covid) +
+  geom_boxplot(aes(x = wave, y = compound, fill = Fraction)) +
+  scale_y_continuous(name = "Sentiment") +
+  scale_fill_manual(values = colors_fractions, name = "") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        axis.title.x = element_blank(),
+        panel.grid.minor = element_blank())
+
+# OLS of sentiment by wave over all parties
+summary(lm(compound ~ wave, data = twitter_covid))
+
+# OLS of sentiment by wave for each party
+reg_wave_fractions <- list()
+for (frac in sort(unique(twitter_covid$Fraction))) {
+  data <- twitter_covid %>%
+    filter(Fraction == frac)
+  reg_wave_fractions[[frac]] <- summary(lm(compound ~ wave, data = data))
+}
+reg_wave_fractions
+
+# OLS of sentiment by press conference for each wave
+# parameter estimate of eventID is a trend value of the sentiment during the wave
+reg_waves <- list()
+for (w in sort(unique(twitter_covid$wave))) {
+  data <- twitter_covid %>%
+    filter(wave == w)
+  reg_waves[[w]] <- summary(lm(compound ~ eventID, data = data))
+}
+reg_waves
+
+# OLS of sentiment by press conference for second wave to include into report
+summary(lm(compound ~ eventID, data = twitter_covid %>% filter(wave == "Second wave")))
+```
+
+#Covid cases plot
+```{r}
+# Plot COVID-19 7 days average for each press conference date
+p <- ggplot() +
+  geom_rect(aes(xmin = event_segments$start, xmax = event_segments$end, ymin = -Inf, ymax = Inf, fill = event_segments$fill), alpha = 0.1) +
+  geom_line(aes(x = eventID, y = mean7d), data = twitter_covid) +
+  geom_text(aes(x = x, y = -300, label = lbls), size = 3.5, data = event_labels) +
+  labs(x = "Press conference ID",
+       y = "7d avg.",
+       title = "7 Days Average of New COVID-19 Cases in CH & FL",
+       subtitle = "Source: Federal Office of Public Health FOPH",
+       caption = "https://www.covid19.admin.ch/en/overview") +
+  scale_x_continuous(breaks = sort(unique(twitter_covid$eventID))) +
+  scale_y_continuous(labels = function(x) format(x, big.mark = "'", scientific = FALSE)) +
+  scale_fill_manual(values = c("New measures" = "red", "Loosening" = "green"), limits = c("New measures", "Loosening")) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        panel.grid.minor = element_blank())
+# save plot
+ggsave(filename = "plots/covid_cases_by_eventID.png", plot = p, device = "png", width = 9, height = 5)
+```
